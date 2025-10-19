@@ -1,0 +1,1460 @@
+---
+title: "Single-Cell RNA-Seq Analysis: Immune Compartment from CELLxGENE"
+author: "Ishani Ray"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: cosmo
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+    fig_width: 10
+    fig_height: 7
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center"
+)
+
+# Load required libraries
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+library(kableExtra)
+library(DT)
+library(ggplot2)
+library(RColorBrewer)
+library(scales)
+library(pheatmap)
+library(viridis)
+library(reticulate)
+library(Matrix)
+library(sctransform)
+library(biomaRt) 
+library(ggrepel)
+
+```
+
+# Introduction
+
+## Background
+
+This analysis examines a **subset** of publicly available single-cell RNA sequencing dataset from the CZ CELLxGENE Discover platform. The dataset (ID: 27c51769-800a-4a44-a885-74ce413b51f5) contains immune compartment cells, providing an opportunity to characterize immune cell heterogeneity at single-cell resolution.
+
+Single-cell RNA sequencing enables the identification of distinct cell populations, rare cell types, and cell-type-specific gene expression patterns that are masked in bulk RNA-seq approaches.
+
+## Research Questions
+
+The primary goals of this analysis are to:
+
+1. Load and quality control the CELLxGENE H5AD dataset
+2. Identify and characterize major immune cell types present in the dataset
+3. Examine cell type composition across samples/conditions
+4. Identify marker genes that define each cell population
+5. Perform differential expression and pathway enrichment analyses
+
+---
+
+# Methods
+
+## Data Acquisition and Loading
+
+The dataset was downloaded from CELLxGENE Discover using the dataset ID. We load the H5AD file using Python's anndata library through reticulate and convert it to a Seurat object.
+```{r load RDS if exists}
+# Define RDS file path
+rds_file <- "immune_compartment_subset_seurat.rds"
+
+# Check if RDS file exists
+if (file.exists(rds_file)) {
+  cat("Loading existing Seurat object from RDS file...\n")
+  seurat_obj <- readRDS(rds_file)
+  cat("Seurat object loaded successfully!\n")
+  print(seurat_obj)
+  original_cell_count <- ncol(seurat_obj)
+  
+}
+```
+
+
+```{r create-data, eval=FALSE}
+
+# Set up Python and load anndata
+use_virtualenv("r-reticulate", required = TRUE)
+py_install("anndata", envname = "r-reticulate")
+ad <- import("anndata", convert = FALSE)
+py_install(c("scanpy", "h5py", "numpy", "pandas"), envname = "r-reticulate")
+
+# Load the H5AD file
+adata <- ad$read_h5ad("27c51769-800a-4a44-a885-74ce413b51f5.h5ad")
+
+cat("H5AD file loaded successfully!\n\n")
+
+# Display basic information
+cat("Dataset dimensions:\n")
+cat("Number of cells:", py_to_r(adata$n_obs), "\n")
+cat("Number of genes:", py_to_r(adata$n_vars), "\n\n")
+
+cat("Available cell metadata (obs) columns:\n")
+obs_cols <- py_to_r(adata$obs$columns$to_list())
+cat(paste(obs_cols, collapse = ", "), "\n\n")
+
+cat("Available gene metadata (var) columns:\n")
+var_cols <- py_to_r(adata$var$columns$to_list())
+cat(paste(var_cols, collapse = ", "), "\n")
+
+# SUBSET THE DATA 
+# ============================================
+# Set subset size (adjust as needed)
+SUBSET_SIZE <- 10000  # Use 10,000 cells for faster analysis
+
+# Get total number of cells
+total_cells <- py_to_r(adata$n_obs)
+
+if (total_cells > SUBSET_SIZE) {
+  cat("Subsetting data to", SUBSET_SIZE, "cells for computational efficiency...\n")
+  
+  # Set seed for reproducibility
+  set.seed(42)
+  
+  # If cell_type exists, do stratified sampling to maintain cell type diversity
+  obs_cols <- py_to_r(adata$obs$columns$to_list())
+  
+  if ("cell_type" %in% obs_cols) {
+    cat("Performing stratified sampling by cell_type...\n")
+    
+    # Get cell types
+    cell_types <- py_to_r(adata$obs['cell_type'].to_numpy())
+
+    
+    # Calculate proportional sample size per cell type
+    cell_type_counts <- table(cell_types)
+    cell_type_props <- cell_type_counts / sum(cell_type_counts)
+    
+    # Sample proportionally from each cell type
+    sampled_indices <- c()
+    for (ct in names(cell_type_counts)) {
+      ct_indices <- which(cell_types == ct)
+      n_sample <- min(ceiling(SUBSET_SIZE * cell_type_props[ct]), length(ct_indices))
+      sampled_indices <- c(sampled_indices, sample(ct_indices, n_sample))
+    }
+    
+    # Trim to exact subset size if needed
+    if (length(sampled_indices) > SUBSET_SIZE) {
+      sampled_indices <- sample(sampled_indices, SUBSET_SIZE)
+    }
+    
+    # Convert to Python indices (0-based)
+    py_indices <- reticulate::np_array(sampled_indices - 1, dtype = "int32")
+    
+  } else {
+    # Random sampling if no cell_type column
+    cat("Performing random sampling...\n")
+    sampled_indices <- sample(1:total_cells, SUBSET_SIZE)
+    py_indices <- reticulate::np_array(sampled_indices - 1, dtype = "int32")
+  }
+  
+  # Subset the AnnData object
+  adata <- adata[py_indices,]
+  
+  cat("Subset complete!\n")
+  cat("New dataset size:", py_to_r(adata$n_obs), "cells\n\n")
+} else {
+  cat("Dataset is small enough, using all cells.\n\n")
+}
+
+cat("Available cell metadata (obs) columns:\n")
+obs_cols <- py_to_r(adata$obs$columns$to_list())
+cat(paste(obs_cols, collapse = ", "), "\n\n")
+
+cat("Available gene metadata (var) columns:\n")
+var_cols <- py_to_r(adata$var$columns$to_list())
+cat(paste(var_cols, collapse = ", "), "\n")
+
+```
+
+
+```{r convert-to-seurat, eval=FALSE}
+
+# Try to get raw counts first, then fall back to X
+if (py_has_attr(adata, "raw") && !py_is_null_xptr(adata$raw)) {
+  cat("Using raw.X for counts\n")
+  counts_mat <- adata$raw$X
+  gene_names <- py_to_r(adata$raw$var_names$to_list())
+} else if ("counts" %in% py_to_r(adata$layers$keys())) {
+  cat("Using layers['counts'] for counts\n")
+  counts_mat <- adata$layers["counts"]
+  gene_names <- py_to_r(adata$var_names$to_list())
+} else {
+  cat("Using X matrix for counts\n")
+  counts_mat <- adata$X
+  gene_names <- py_to_r(adata$var_names$to_list())
+}
+
+cell_names <- py_to_r(adata$obs_names$to_list())
+
+# Convert to character vectors to ensure proper names
+gene_names <- as.character(gene_names)
+cell_names <- as.character(cell_names)
+cat("Gene names length:", length(gene_names), "\n")
+cat("Cell names length:", length(cell_names), "\n")
+
+# Handle sparse matrix efficiently
+cat("Converting sparse matrix to R sparse format...\n")
+
+if (inherits(counts_mat, "scipy.sparse.csr.csr_matrix") || 
+    inherits(counts_mat, "scipy.sparse.csc.csc_matrix")) {
+  
+  # Convert to CSC format if not already
+  if (inherits(counts_mat, "scipy.sparse.csr.csr_matrix")) {
+    counts_mat <- counts_mat$tocsc()
+  }
+  
+  # Extract sparse matrix components
+  i <- py_to_r(counts_mat$indices)
+  p <- py_to_r(counts_mat$indptr)
+  x <- py_to_r(counts_mat$data)
+  dims <- py_to_r(counts_mat$shape)
+  
+ cat("Sparse matrix dimensions (cells x genes):", dims[1], "x", dims[2], "\n")
+  
+  # Create R sparse matrix (dgCMatrix) WITHOUT names first
+  # scipy stores as cells x genes
+  counts_temp <- sparseMatrix(
+    i = i,
+    p = p,
+    x = x,
+    dims = dims,
+    index1 = FALSE,
+    dimnames = NULL  # Don't set names during creation
+  )
+ # Transpose to genes x cells for Seurat
+  counts <- t(counts_temp)
+  
+  # Now assign names AFTER transposition
+  rownames(counts) <- gene_names
+  colnames(counts) <- cell_names
+  
+  cat("Sparse matrix conversion complete!\n")
+  cat("Final matrix dimensions:", nrow(counts), "genes x", ncol(counts), "cells\n")
+  
+  # Clean up
+  rm(counts_temp)
+  
+} else {
+  cat("Matrix is dense format\n")
+  counts_dense <- py_to_r(counts_mat)
+  counts <- t(counts_dense)
+  rownames(counts) <- gene_names
+  colnames(counts) <- cell_names
+  rm(counts_dense)
+}
+
+# Extract metadata
+cat("Extracting metadata...\n")
+metadata <- py_to_r(adata$obs)
+rownames(metadata) <- cell_names
+
+# Create Seurat object
+cat("\nCreating Seurat object...\n")
+seurat_obj <- CreateSeuratObject(
+  counts = counts,
+  meta.data = metadata,
+  project = "Immune_Compartment_Subset",
+  min.cells = 0,
+  min.features = 0
+)
+
+cat("\nSeurat object created successfully!\n")
+print(seurat_obj)
+
+# Save original cell count
+original_cell_count <- ncol(seurat_obj)
+
+# Clear large objects to free memory
+rm(counts_mat, counts, i, p, x, adata)
+gc()
+
+```
+
+```{r annotate, eval=FALSE}
+# ANNOTATE GENES WITH HUGO SYMBOLS
+  cat("\n=== Annotating Ensembl IDs with Gene Symbols ===\n")
+  
+  # Get current gene names (Ensembl IDs)
+  ensembl_ids <- rownames(seurat_obj)
+  cat("Total genes in dataset:", length(ensembl_ids), "\n")
+  
+  # Check if they look like Ensembl IDs
+  cat("First 5 gene IDs:", head(ensembl_ids, 5), "\n")
+  
+  # Connect to Ensembl BioMart
+  cat("Connecting to Ensembl BioMart (human)...\n")
+  ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+  
+  # Query BioMart for gene symbols
+  cat("Querying gene symbols...\n")
+  gene_annotations <- getBM(
+    attributes = c('ensembl_gene_id', 'external_gene_name', 'gene_biotype'),
+    filters = 'ensembl_gene_id',
+    values = ensembl_ids,
+    mart = ensembl
+  )
+  
+  cat("Retrieved annotations for", nrow(gene_annotations), "genes\n")
+  
+  # Create a mapping dataframe
+  gene_map <- data.frame(
+    ensembl_id = ensembl_ids,
+    stringsAsFactors = FALSE
+  )
+  
+  # Merge with annotations
+  gene_map <- left_join(gene_map, gene_annotations, 
+                        by = c("ensembl_id" = "ensembl_gene_id"))
+  
+  # For genes without symbols, use Ensembl ID
+  gene_map$gene_symbol <- ifelse(
+    is.na(gene_map$external_gene_name) | gene_map$external_gene_name == "",
+    gene_map$ensembl_id,
+    gene_map$external_gene_name
+  )
+  
+  # Handle duplicates by making gene symbols unique
+  gene_map$gene_symbol_unique <- make.unique(gene_map$gene_symbol)
+  
+  cat("\nAnnotation summary:\n")
+  cat("Genes with symbols:", sum(!is.na(gene_map$external_gene_name) & 
+                                   gene_map$external_gene_name != ""), "\n")
+  cat("Genes without symbols (kept as Ensembl ID):", 
+      sum(is.na(gene_map$external_gene_name) | gene_map$external_gene_name == ""), "\n")
+  
+  # Add gene annotations to Seurat object metadata
+  # Add feature-level metadata to the RNA assay
+  # Ensure rownames of gene_map match the assay
+rownames(gene_map) <- gene_map$ensembl_id
+seurat_obj[["RNA"]] <- AddMetaData(
+  object = seurat_obj[["RNA"]],
+  metadata = gene_map %>%
+    dplyr::select(ensembl_id, gene_symbol = gene_symbol_unique, gene_biotype)
+)
+
+  # Update rownames to use gene symbols
+  cat("\nUpdating gene names in Seurat object...\n")
+  
+  # Get all assay data
+  counts_data <- GetAssayData(seurat_obj, slot = "counts")
+  rownames(counts_data) <- gene_map$gene_symbol_unique
+  
+  # Create new assay with updated names
+  seurat_obj[["RNA"]] <- CreateAssayObject(counts = counts_data)
+  
+  # Re-add metadata
+  seurat_obj@meta.data <- metadata
+  
+  cat("Gene annotation complete!\n")
+  cat("First 10 gene names:", head(rownames(seurat_obj), 10), "\n\n")
+  
+  # SAVE SEURAT OBJECT TO RDS
+  # ============================================
+  cat("Saving Seurat object to RDS file:", rds_file, "\n")
+  saveRDS(seurat_obj, file = rds_file)
+  cat("RDS file saved successfully!\n")
+  cat("Next time, the analysis will load this file directly.\n\n")
+  
+  print(seurat_obj)
+
+```
+
+---
+
+# Results
+
+## Gene Annotation Summary
+
+```{r gene-annotation-table}
+# Display gene annotation information
+# Get current gene names (Ensembl IDs)
+  ensembl_ids <- rownames(seurat_obj)
+  cat("Total genes in dataset:", length(ensembl_ids), "\n")
+  
+  # Check if they look like Ensembl IDs
+  cat("First 5 gene IDs:", head(ensembl_ids, 5), "\n")
+  
+  # Connect to Ensembl BioMart
+  cat("Connecting to Ensembl BioMart (human)...\n")
+  ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+  
+  # Query BioMart for gene symbols
+  cat("Querying gene symbols...\n")
+  gene_annotations <- getBM(
+    attributes = c('ensembl_gene_id', 'external_gene_name', 'gene_biotype'),
+    filters = 'ensembl_gene_id',
+    values = ensembl_ids,
+    mart = ensembl
+  )
+  
+  cat("Retrieved annotations for", nrow(gene_annotations), "genes\n")
+  
+  # Create a mapping dataframe
+  gene_map <- data.frame(
+    ensembl_id = ensembl_ids,
+    stringsAsFactors = FALSE
+  )
+  
+  # Merge with annotations
+  gene_map <- left_join(gene_map, gene_annotations, 
+                        by = c("ensembl_id" = "ensembl_gene_id"))
+  
+  # For genes without symbols, use Ensembl ID
+  gene_map$gene_symbol <- ifelse(
+    is.na(gene_map$external_gene_name) | gene_map$external_gene_name == "",
+    gene_map$ensembl_id,
+    gene_map$external_gene_name
+  )
+  
+  # Handle duplicates by making gene symbols unique
+  gene_map$gene_symbol_unique <- make.unique(gene_map$gene_symbol)
+  
+  gene_info <- gene_map
+head(gene_info)
+
+if ("ensembl_id" %in% colnames(gene_info)) {
+  
+  cat("Gene Annotation Summary:\n")
+  cat("Total genes:", nrow(gene_info), "\n")
+  cat("Genes with HUGO symbols:", sum(gene_info$ensembl_id != gene_info$gene_symbol), "\n")
+  cat("Genes kept as Ensembl ID:", sum(gene_info$ensembl_id == gene_info$gene_symbol), "\n\n")
+  
+  # Show biotype distribution if available
+  if ("gene_biotype" %in% colnames(gene_info)) {
+    cat("Gene biotype distribution:\n")
+    print(table(gene_info$gene_biotype))
+    
+    # Visualize biotype distribution
+    biotype_counts <- as.data.frame(table(gene_info$gene_biotype))
+    colnames(biotype_counts) <- c("Biotype", "Count")
+    biotype_counts <- biotype_counts %>% arrange(desc(Count)) %>% head(10)
+    
+    ggplot(biotype_counts, aes(x = reorder(Biotype, Count), y = Count)) +
+      geom_bar(stat = "identity", fill = "steelblue") +
+      coord_flip() +
+      labs(title = "Top 10 Gene Biotypes in Dataset",
+           x = "Gene Biotype", y = "Number of Genes") +
+      theme_minimal()
+  }
+  
+  # Display example genes
+  cat("\nExample annotated genes:\n")
+  gene_info %>%
+    dplyr::select(ensembl_id, gene_symbol, gene_biotype) %>%
+    head(20) %>%
+    kable() %>%
+    kable_styling(bootstrap_options = c("striped", "hover"))
+}
+```
+
+## Quality Control
+
+```{r qc-metrics}
+# Calculate QC metrics if not already present
+if (!"nCount_RNA" %in% colnames(seurat_obj@meta.data)) {
+  seurat_obj[["nCount_RNA"]] <- colSums(seurat_obj@assays$RNA@counts)
+  seurat_obj[["nFeature_RNA"]] <- colSums(seurat_obj@assays$RNA@counts > 0)
+}
+
+# Calculate mitochondrial percentage
+seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-")
+
+# Calculate ribosomal percentage
+seurat_obj[["percent.rb"]] <- PercentageFeatureSet(seurat_obj, pattern = "^RP[SL]")
+
+# Visualize QC metrics
+p1 <- VlnPlot(seurat_obj, 
+              features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), 
+              ncol = 3, 
+              pt.size = 0.1) & 
+  theme(axis.title.x = element_blank(), 
+        plot.title = element_text(size = 10))
+
+p1
+
+hist(seurat_obj@meta.data$nFeature_RNA, breaks = 100)
+```
+
+
+```{r qc-scatter, fig.height=5}
+plot1 <- FeatureScatter(seurat_obj, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+  geom_hline(yintercept = 20, linetype = "dashed", color = "red", linewidth = 1) +
+  ggtitle("QC: UMI vs Mitochondrial %") +
+  theme_minimal()
+
+plot2 <- FeatureScatter(seurat_obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+  ggtitle("QC: UMI vs Gene Count") +
+  theme_minimal()
+
+plot1 + plot2
+```
+
+
+```{r qc-summary}
+qc_stats <- data.frame(
+  Metric = c("Total Cells (Subset)", 
+             "Median Genes/Cell", 
+             "Median UMIs/Cell", 
+             "Median % MT",
+             "Mean % MT"),
+  Value = c(ncol(seurat_obj),
+            round(median(seurat_obj$nFeature_RNA)),
+            round(median(seurat_obj$nCount_RNA)),
+            round(median(seurat_obj$percent.mt), 2),
+            round(mean(seurat_obj$percent.mt), 2))
+)
+
+kable(qc_stats, 
+      caption = "Quality Control Summary Statistics (Subset)",
+      align = 'lr') %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                full_width = FALSE,
+                position = "left") %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4CAF50")
+
+```
+
+## Explore Existing Metadata
+
+```{r metadata-exploration}
+cat("Available metadata columns:\n")
+print(colnames(seurat_obj@meta.data))
+
+if ("cell_type" %in% colnames(seurat_obj@meta.data)) {
+  cat("\n=== Cell Type Distribution (in subset) ===\n")
+  cell_type_table <- sort(table(seurat_obj$cell_type), decreasing = TRUE)
+  print(head(cell_type_table, 20))
+}
+
+if ("tissue" %in% colnames(seurat_obj@meta.data)) {
+  cat("\n=== Tissue Distribution ===\n")
+  print(table(seurat_obj$tissue))
+}
+
+if ("disease" %in% colnames(seurat_obj@meta.data)) {
+  cat("\n=== Disease Status ===\n")
+  print(table(seurat_obj$disease))
+}
+
+if ("donor_id" %in% colnames(seurat_obj@meta.data)) {
+  cat("\n=== Number of Donors ===\n")
+  cat(length(unique(seurat_obj$donor_id)), "unique donors\n")
+}
+```
+
+## Filter cells based on QC metrics
+
+```{r filter-cells}
+seurat_obj <- subset(
+  seurat_obj,
+  subset = nFeature_RNA >= 200 &
+           nFeature_RNA <= 5000 &
+           percent.mt <= 5 &
+           nCount_RNA >= 500 &
+           nCount_RNA <= 30000
+)
+
+```
+
+## Normalization and Feature Selection
+
+```{r normalization}
+seurat_obj <- NormalizeData(seurat_obj, 
+                            normalization.method = "LogNormalize", 
+                            scale.factor = 10000)
+
+seurat_obj <- FindVariableFeatures(seurat_obj, 
+                                   selection.method = "vst", 
+                                   nfeatures = 2000)
+
+top10 <- head(VariableFeatures(seurat_obj), 10)
+
+cat("Top 10 most variable genes:\n")
+cat(paste(top10, collapse = ", "), "\n\n")
+
+plot1 <- VariableFeaturePlot(seurat_obj) + 
+  theme_minimal() +
+  ggtitle("Variable Feature Selection")
+
+plot2 <- LabelPoints(plot = plot1, 
+                     points = top10, 
+                     repel = TRUE)
+plot2
+```
+
+
+```{r scaling}
+# Scale only variable features
+seurat_obj <- ScaleData(seurat_obj, features = VariableFeatures(seurat_obj))
+cat("Data normalized and scaled.\n")
+```
+
+## Dimensionality Reduction
+
+```{r pca}
+seurat_obj <- RunPCA(seurat_obj, 
+                     features = VariableFeatures(object = seurat_obj), 
+                     verbose = FALSE)
+
+print(seurat_obj[["pca"]], dims = 1:5, nfeatures = 5)
+
+VizDimLoadings(seurat_obj, dims = 1:2, reduction = "pca")
+
+DimPlot(seurat_obj, reduction = "pca") + NoLegend()
+
+DimHeatmap(seurat_obj, dims = 1, cells = 500, balanced = TRUE)
+```
+
+
+```{r elbow-plot}
+ElbowPlot(seurat_obj, ndims = 30) +
+  geom_vline(xintercept = 15, linetype = "dashed", color = "red", linewidth = 1) +
+  ggtitle("Elbow Plot - Selecting Number of PCs") +
+  theme_minimal()
+```
+
+## Clustering and UMAP
+
+```{r clustering}
+n_pcs <- 15  # Reduced for subset
+
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:n_pcs)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.5, verbose = FALSE)
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:n_pcs, verbose = FALSE)
+
+n_clusters <- length(unique(Idents(seurat_obj)))
+
+DimPlot(seurat_obj, 
+        reduction = "umap", 
+        label = TRUE, 
+        label.size = 6,
+        pt.size = 0.8) +
+  ggtitle(paste0("UMAP - ", n_clusters, "UMAP: Cluster Assignments ")) +
+  theme_minimal()
+```
+
+```{r umap-metadata}
+if ("cell_type" %in% colnames(seurat_obj@meta.data)) {
+  DimPlot(seurat_obj, 
+          reduction = "umap", 
+          group.by = "cell_type",
+          label = TRUE,
+          repel = TRUE,
+          pt.size = 0.5) +
+    ggtitle("UMAP - Cell Type Annotations") +
+    theme_minimal() +
+    theme(legend.position = "right")
+}
+```
+
+## Cell Type Analysis
+
+
+```{r existing-annotations}
+
+# Cluster composition
+cluster_table <- as.data.frame(table(Idents(seurat_obj)))
+colnames(cluster_table) <- c("Cluster", "Count")
+cluster_table$Percentage <- round(cluster_table$Count / sum(cluster_table$Count) * 100, 2)
+
+ggplot(cluster_table, aes(x = Cluster, y = Count, fill = Cluster)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = paste0(Count, "\n(", Percentage, "%)")), 
+            vjust = -0.5, size = 3) +
+  labs(title = "Cells per Cluster", x = "Cluster", y = "Number of Cells") +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1)  # slant x labels
+  )
+
+
+# If cell_type exists, show composition
+if ("cell_type" %in% colnames(seurat_obj@meta.data)) {
+  Idents(seurat_obj) <- seurat_obj$cell_type
+  
+  cell_counts <- table(seurat_obj$cell_type)
+  cell_props <- prop.table(cell_counts) * 100
+  
+  prop_df <- data.frame(
+    Cell_Type = names(cell_props),
+    Count = as.numeric(cell_counts),
+    Percentage = round(as.numeric(cell_props), 2)
+  ) %>%
+    arrange(desc(Percentage))
+  
+  kable(prop_df, 
+        caption = "Cell Type Distribution (Subset)",
+        col.names = c("Cell Type", "Cell Count", "Percentage (%)"),
+        align = 'lrr') %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                  full_width = FALSE) %>%
+    row_spec(0, bold = TRUE, color = "white", background = "#2196F3")
+  
+  ggplot(prop_df %>% head(15), 
+         aes(x = reorder(Cell_Type, Percentage), y = Percentage, fill = Cell_Type)) +
+    geom_bar(stat = "identity", color = "black", size = 0.3) +
+    coord_flip() +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    labs(title = "Cell Type Distribution",
+         x = "Cell Type",
+         y = "Percentage (%)") +
+    geom_text(aes(label = paste0(Percentage, "%")), hjust = -0.1, size = 3)
+}
+```
+
+---
+
+# Differential Expression Analysis
+
+## Find Cluster Markers
+
+```{r find-all-markers}
+# Find markers for all clusters
+cat("Finding differentially expressed genes for all clusters...\n")
+cat("This may take a few minutes...\n\n")
+
+all.markers <- FindAllMarkers(
+  seurat_obj, 
+  only.pos = TRUE, 
+  min.pct = 0.25, 
+  logfc.threshold = 0.25
+)
+
+cat("Found", nrow(all.markers), "significant markers across all clusters\n\n")
+
+# Filter for highly significant markers
+significant.markers <- all.markers %>%
+  filter(p_val_adj < 0.05, avg_log2FC > 0.5)
+
+cat("Highly significant markers (p_adj < 0.05, log2FC > 0.5):", 
+    nrow(significant.markers), "\n")
+
+# Show top markers per cluster
+top_markers_per_cluster <- all.markers %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 5)
+
+cat("\nTop 5 markers per cluster:\n")
+top_markers_per_cluster %>%
+  dplyr::select(cluster, gene, avg_log2FC, pct.1, pct.2, p_val_adj) %>%
+  kable(digits = 3, caption = "Top Markers by Cluster") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## Marker Gene Heatmap
+
+```{r marker-heatmap, fig.width=12, fig.height=10}
+# Select top markers for heatmap
+top10_markers <- all.markers %>%
+  filter(p_val_adj < 0.05) %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 10) %>%
+  ungroup()
+
+if (nrow(top10_markers) > 0) {
+  DoHeatmap(seurat_obj, features = top10_markers$gene) + 
+    ggtitle("Top 10 Marker Genes per Cluster") +
+    theme(axis.text.y = element_text(size = 8))
+} else {
+  cat("No significant markers found for heatmap\n")
+}
+```
+
+## Violin Plots for Key Markers
+
+```{r violin-plots, fig.width=14, fig.height=10}
+# Select top 2 markers per cluster for violin plots
+top_genes_violin <- all.markers %>%
+  filter(p_val_adj < 0.05) %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 2) %>%
+  pull(gene) %>%
+  unique() %>%
+  head(12)  # Limit to 12 for visualization
+
+if (length(top_genes_violin) > 0) {
+  VlnPlot(seurat_obj, features = top_genes_violin, ncol = 4, pt.size = 0)
+} else {
+  cat("No markers available for violin plots\n")
+}
+```
+
+## Feature Plots for Top Markers
+
+```{r feature-plots, fig.width=14, fig.height=12}
+# Feature plots showing spatial distribution of top markers
+top_genes_feature <- all.markers %>%
+  filter(p_val_adj < 0.05) %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 1) %>%
+  pull(gene) %>%
+  head(9)  # Top marker from each cluster, max 9
+
+if (length(top_genes_feature) > 0) {
+  FeaturePlot(seurat_obj, features = top_genes_feature, ncol = 3)
+} else {
+  cat("No markers available for feature plots\n")
+}
+```
+
+## Dot Plot for Marker Genes
+
+```{r dotplot, fig.width=12, fig.height=8}
+# Dot plot showing marker expression across clusters
+top_markers_dotplot <- all.markers %>%
+  filter(p_val_adj < 0.05) %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 3) %>%
+  pull(gene)
+
+if (length(top_markers_dotplot) > 0) {
+  DotPlot(seurat_obj, features = unique(top_markers_dotplot)) + 
+    coord_flip() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    ggtitle("Marker Gene Expression Across Clusters")
+} else {
+  cat("No markers available for dot plot\n")
+}
+```
+
+
+## Known Immune Markers
+
+```{r known-markers, fig.height=10, fig.width=12}
+
+immune_markers <- c(
+  "CD3D", "CD3E", "CD4", "IL7R", "CD8A", "CD8B",
+  "NKG7", "GNLY", "MS4A1", "CD79A", "CD14", "LYZ", "MZB1", "JCHAIN", "IGKC", "FCER1A", "CST3", "CLEC9A", "CD19", "NCAM1", "CCR7", "CD3G", "FCGR3A")
+
+immune_markers_present <- immune_markers[immune_markers %in% rownames(seurat_obj)]
+
+if (length(immune_markers_present) > 0) {
+  FeaturePlot(seurat_obj, 
+              features = immune_markers_present[1:min(9, length(immune_markers_present))], 
+              ncol = 3,
+              pt.size = 0.5) &
+    theme_minimal()
+}
+
+```
+
+## Pairwise Cluster Comparisons
+
+```{r pairwise-comparisons}
+# Example: Compare two specific clusters if they exist
+clusters <- levels(Idents(seurat_obj))
+
+if (length(clusters) >= 2) {
+  cat("Comparing cluster", clusters[1], "vs cluster", clusters[2], "\n")
+  
+  cluster_comparison <- FindMarkers(
+    seurat_obj, 
+    ident.1 = clusters[1], 
+    ident.2 = clusters[2],
+    min.pct = 0.25
+  )
+  
+  # Add gene names as column
+  cluster_comparison$gene <- rownames(cluster_comparison)
+  
+  # Show top upregulated in cluster 1
+  cat("\nTop genes upregulated in cluster", clusters[1], ":\n")
+  cluster_comparison %>%
+    filter(avg_log2FC > 0) %>%
+    arrange(p_val_adj) %>%
+    head(10) %>%
+    dplyr::select(gene, avg_log2FC, pct.1, pct.2, p_val_adj) %>%
+    kable(digits = 3) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"))
+  
+  # Show top upregulated in cluster 2
+  cat("\nTop genes upregulated in cluster", clusters[2], ":\n")
+  cluster_comparison %>%
+    filter(avg_log2FC < 0) %>%
+    arrange(p_val_adj) %>%
+    head(10) %>%
+    dplyr::select(gene, avg_log2FC, pct.1, pct.2, p_val_adj) %>%
+    kable(digits = 3) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"))
+}
+```
+
+## Marker Gene Summary Table
+
+```{r marker-summary-table}
+# Create comprehensive marker table
+marker_summary <- all.markers %>%
+  group_by(cluster) %>%
+  summarise(
+    n_markers = n(),
+    n_significant = sum(p_val_adj < 0.05),
+    top_gene = gene[which.max(avg_log2FC)],
+    max_log2FC = max(avg_log2FC)
+  )
+
+marker_summary %>%
+  kable(caption = "Marker Gene Summary by Cluster", digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+# Export top markers to CSV
+top_markers_export <- all.markers %>%
+  filter(p_val_adj < 0.05) %>%
+  arrange(cluster, desc(avg_log2FC))
+
+write.csv(top_markers_export, "cluster_markers.csv", row.names = FALSE)
+cat("\nAll significant markers exported to 'cluster_markers.csv'\n")
+```
+
+---
+
+# Clinical Metadata Analysis
+
+## Disease Subtype Comparisons
+
+```{r disease-umap, fig.width=12, fig.height=5}
+# Visualize cell distribution by disease subtype
+if ("disease" %in% colnames(seurat_obj@meta.data)) {
+  p1 <- DimPlot(seurat_obj, reduction = "umap", group.by = "disease", pt.size = 0.3) +
+    ggtitle("UMAP by Disease Subtype") +
+    theme(legend.position = "right", legend.text = element_text(size = 8))
+  
+  p2 <- DimPlot(seurat_obj, reduction = "umap", group.by = "cell_type", pt.size = 0.3) +
+    ggtitle("UMAP by Cell Type") +
+    theme(legend.position = "right", legend.text = element_text(size = 6))
+  
+  p1 | p2
+}
+```
+
+```{r disease-composition}
+# Cell type composition across disease subtypes
+if ("disease" %in% colnames(seurat_obj@meta.data) && 
+    "cell_type" %in% colnames(seurat_obj@meta.data)) {
+  
+  disease_celltype <- seurat_obj@meta.data %>%
+    group_by(disease, cell_type) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    group_by(disease) %>%
+    mutate(percentage = count / sum(count) * 100)
+  
+  # Stacked bar chart
+  ggplot(disease_celltype, aes(x = disease, y = percentage, fill = cell_type)) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+    labs(title = "Cell Type Composition by Disease Subtype",
+         x = "Disease", y = "Percentage", fill = "Cell Type") +
+    theme_minimal() +
+    theme(legend.text = element_text(size = 7))
+  
+  # Focus on immune cell differences
+  # Calculate cell type proportions per disease
+  celltype_props <- seurat_obj@meta.data %>%
+    group_by(disease, cell_type) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    group_by(disease) %>%
+    mutate(total = sum(count),
+           proportion = count / total) %>%
+    dplyr::select(disease, cell_type, proportion) %>%
+    pivot_wider(names_from = disease, values_from = proportion, values_fill = 0)
+  
+  celltype_props %>%
+    head(20) %>%
+    kable(digits = 3, caption = "Cell Type Proportions by Disease") %>%
+    kable_styling(bootstrap_options = c("striped", "hover"), font_size = 10) %>%
+    scroll_box(width = "100%")
+}
+```
+
+## Triple-Negative vs ER-Positive Comparison
+
+```{r tnbc-vs-erpos, fig.width=14, fig.height=10}
+# Compare TNBC to ER-positive breast cancer
+if ("disease" %in% colnames(seurat_obj@meta.data)) {
+  
+  # Subset to TNBC and ER+ samples
+  tnbc_cells <- seurat_obj@meta.data$disease == "triple-negative breast carcinoma"
+  erpos_cells <- seurat_obj@meta.data$disease == "estrogen-receptor positive breast cancer"
+  
+  if (sum(tnbc_cells) > 0 && sum(erpos_cells) > 0) {
+    cat("Comparing TNBC (n=", sum(tnbc_cells), ") vs ER+ (n=", sum(erpos_cells), ")\n\n")
+    
+    # Create a binary classification
+    seurat_obj$disease_comparison <- ifelse(
+      tnbc_cells, "TNBC",
+      ifelse(erpos_cells, "ER+", "Other")
+    )
+    
+    # Visualize
+    p <- DimPlot(seurat_obj, reduction = "umap", group.by = "disease_comparison", 
+            cells.highlight = list(
+              "TNBC" = colnames(seurat_obj)[tnbc_cells],
+              "ER+" = colnames(seurat_obj)[erpos_cells]
+            ),
+            cols.highlight = c("red", "blue")) +
+      ggtitle("TNBC vs ER-Positive Breast Cancer")
+    print(p)
+    
+    # Cell type differences
+    comparison_celltype <- seurat_obj@meta.data %>%
+      filter(disease_comparison %in% c("TNBC", "ER+")) %>%
+      group_by(disease_comparison, cell_type) %>%
+      summarise(count = n(), .groups = "drop") %>%
+      group_by(disease_comparison) %>%
+      mutate(percentage = count / sum(count) * 100) %>%
+      dplyr::select(disease_comparison, cell_type, percentage) %>%
+      pivot_wider(names_from = disease_comparison, values_from = percentage, values_fill = 0) %>%
+      mutate(difference = `TNBC` - `ER+`) %>%
+      arrange(desc(abs(difference)))
+    
+    cat("\nCell type enrichment differences (TNBC vs ER+):\n")
+    comparison_celltype %>%
+      head(15) %>%
+      kable(digits = 2, caption = "Top Cell Type Differences") %>%
+      kable_styling(bootstrap_options = c("striped", "hover"))
+    
+    # Plot differences
+    top_diff_celltypes <- comparison_celltype %>%
+      head(10) %>%
+      pivot_longer(cols = c("TNBC", "ER+"), names_to = "Disease", values_to = "Percentage")
+    
+    ggplot(top_diff_celltypes, aes(x = reorder(cell_type, difference), y = Percentage, fill = Disease)) +
+      geom_bar(stat = "identity", position = "dodge") +
+      coord_flip() +
+      labs(title = "Top Cell Types with Differential Abundance (TNBC vs ER+)",
+           x = "Cell Type", y = "Percentage") +
+      theme_minimal()
+  }
+}
+```
+
+## Donor-Level Analysis
+
+```{r donor-analysis, fig.width=12, fig.height=8}
+# Analyze cell composition per donor
+if ("donor_id" %in% colnames(seurat_obj@meta.data)) {
+  
+  # Cells per donor
+  donor_counts <- as.data.frame(table(seurat_obj$donor_id))
+  colnames(donor_counts) <- c("Donor", "Cells")
+  donor_counts <- donor_counts %>% arrange(desc(Cells))
+  
+  cat("Cells per donor (top 20):\n")
+  donor_counts %>%
+    head(20) %>%
+    kable() %>%
+    kable_styling(bootstrap_options = c("striped", "hover"))
+  
+  # Distribution
+  ggplot(donor_counts, aes(x = Cells)) +
+    geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+    labs(title = "Distribution of Cell Counts per Donor",
+         x = "Number of Cells", y = "Number of Donors") +
+    theme_minimal()
+}
+```
+
+## Immune Checkpoint Gene Expression
+
+```{r checkpoint-genes, fig.width=14, fig.height=10}
+# Key immune checkpoint genes
+checkpoint_genes <- c("PDCD1", "CD274", "PDCD1LG2", "CTLA4", "LAG3", 
+                      "HAVCR2", "TIGIT", "BTLA", "CD27", "ICOS")
+
+# Check which are present
+present_checkpoints <- checkpoint_genes[checkpoint_genes %in% rownames(seurat_obj)]
+
+if (length(present_checkpoints) > 0) {
+  cat("Found", length(present_checkpoints), "checkpoint genes:", 
+      paste(present_checkpoints, collapse = ", "), "\n\n")
+  
+  # Feature plots
+  if (length(present_checkpoints) <= 9) {
+    FeaturePlot(seurat_obj, features = present_checkpoints, ncol = 3)
+  } else {
+    FeaturePlot(seurat_obj, features = head(present_checkpoints, 9), ncol = 3)
+  }
+  
+  # Dot plot by cell type
+  if ("cell_type" %in% colnames(seurat_obj@meta.data)) {
+    DotPlot(seurat_obj, features = present_checkpoints, group.by = "cell_type") +
+      coord_flip() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+      ggtitle("Immune Checkpoint Expression by Cell Type")
+  }
+  
+  # Compare checkpoint expression across disease subtypes
+  if ("disease" %in% colnames(seurat_obj@meta.data) && length(present_checkpoints) >= 1) {
+    # Calculate average expression per disease
+    checkpoint_expr <- FetchData(seurat_obj, vars = c(present_checkpoints, "disease"))
+    
+    checkpoint_avg <- checkpoint_expr %>%
+      group_by(disease) %>%
+      summarise(across(all_of(present_checkpoints), mean, na.rm = TRUE)) %>%
+      pivot_longer(cols = -disease, names_to = "gene", values_to = "avg_expression")
+    
+    # Heatmap of checkpoint expression by disease
+    checkpoint_matrix <- checkpoint_avg %>%
+      pivot_wider(names_from = gene, values_from = avg_expression) %>%
+      column_to_rownames("disease") %>%
+      as.matrix()
+    
+    pheatmap(t(checkpoint_matrix),
+             scale = "row",
+             main = "Immune Checkpoint Expression by Disease Subtype",
+             fontsize_row = 10,
+             fontsize_col = 8)
+  }
+}
+```
+
+## Cytotoxic and Regulatory T Cell Analysis
+
+```{r treg-cytotoxic, fig.width=14, fig.height=8}
+# Focus on regulatory vs cytotoxic T cells
+if ("cell_type" %in% colnames(seurat_obj@meta.data)) {
+  
+  # Identify T cell subsets
+  tcell_types <- grep("T cell|regulatory", seurat_obj$cell_type, value = TRUE, ignore.case = TRUE)
+  
+  if (length(tcell_types) > 0) {
+    cat("T cell types in dataset:\n")
+    cat(paste(unique(tcell_types), collapse = "\n"), "\n\n")
+    
+    # Subset to T cells
+    tcell_subset <- subset(seurat_obj, subset = cell_type %in% tcell_types)
+    
+    if (ncol(tcell_subset) > 0) {
+      # UMAP of just T cells
+      DimPlot(tcell_subset, reduction = "umap", group.by = "cell_type", label = TRUE) +
+        ggtitle("T Cell Subsets") +
+        theme(legend.position = "right")
+      
+      # Key T cell markers
+      tcell_markers <- c("CD3D", "CD4", "CD8A", "FOXP3", "IL2RA", "GZMB", "PRF1", "IFNG")
+      present_tcell_markers <- tcell_markers[tcell_markers %in% rownames(seurat_obj)]
+      
+      if (length(present_tcell_markers) > 0) {
+        cat("Found T cell markers:", paste(present_tcell_markers, collapse = ", "), "\n")
+        
+        # Dot plot
+        DotPlot(tcell_subset, features = present_tcell_markers, group.by = "cell_type") +
+          coord_flip() +
+          theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+          ggtitle("T Cell Marker Expression")
+      }
+      
+      # Compare T cell proportions across disease subtypes
+      if ("disease" %in% colnames(tcell_subset@meta.data)) {
+        tcell_disease <- tcell_subset@meta.data %>%
+          group_by(disease, cell_type) %>%
+          summarise(count = n(), .groups = "drop") %>%
+          group_by(disease) %>%
+          mutate(proportion = count / sum(count))
+        
+        ggplot(tcell_disease, aes(x = disease, y = proportion, fill = cell_type)) +
+          geom_bar(stat = "identity") +
+          coord_flip() +
+          labs(title = "T Cell Subset Proportions by Disease",
+               x = "Disease", y = "Proportion") +
+          theme_minimal() +
+          theme(legend.text = element_text(size = 8))
+      }
+    }
+  }
+}
+```
+
+## Macrophage Polarization Analysis
+
+```{r macrophage-analysis, fig.width=14, fig.height=10}
+
+# Ensure 'cell_type' exists
+if ("cell_type" %in% colnames(seurat_obj@meta.data)) {
+
+  # Identify macrophage populations
+  mac_cells <- grep("macrophage", seurat_obj$cell_type, value = TRUE, ignore.case = TRUE)
+
+  if (length(mac_cells) > 0) {
+    cat("Macrophage populations:", paste(unique(mac_cells), collapse = ", "), "\n\n")
+
+    # Subset macrophages
+    mac_subset <- subset(seurat_obj, subset = cell_type %in% mac_cells)
+
+    if (ncol(mac_subset) > 0) {
+      cat("Total macrophages:", ncol(mac_subset), "\n\n")
+
+      # Define polarization markers
+      m1_markers <- c("CD86", "IL1B", "TNF", "NOS2", "CXCL10", "IL6")
+      m2_markers <- c("CD163", "CD206", "MRC1", "ARG1", "IL10", "TGFB1", "CCL18")
+
+      # Filter markers present in data
+      present_m1 <- m1_markers[m1_markers %in% rownames(mac_subset)]
+      present_m2 <- m2_markers[m2_markers %in% rownames(mac_subset)]
+
+      cat("M1-like markers found:", paste(present_m1, collapse = ", "), "\n")
+      cat("M2-like markers found:", paste(present_m2, collapse = ", "), "\n\n")
+
+      all_mac_markers <- c(present_m1, present_m2)
+
+      # Feature plots (paginated if >9 markers)
+      if (length(all_mac_markers) > 0) {
+        for (i in seq(1, length(all_mac_markers), by = 9)) {
+          FeaturePlot(mac_subset, features = all_mac_markers[i:min(i+8, length(all_mac_markers))], ncol = 3)
+        }
+      }
+
+      # DotPlot by disease
+      if ("disease" %in% colnames(mac_subset@meta.data)) {
+        print(
+          DotPlot(mac_subset, features = all_mac_markers, group.by = "disease") +
+            coord_flip() +
+            theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+            ggtitle("Macrophage Polarization Markers by Disease")
+        )
+      }
+
+      # Add M1/M2 module scores
+      if (length(present_m1) > 0) {
+        mac_subset <- AddModuleScore(mac_subset, features = list(present_m1), name = "M1_score")
+      }
+      if (length(present_m2) > 0) {
+        mac_subset <- AddModuleScore(mac_subset, features = list(present_m2), name = "M2_score")
+      }
+
+      # FeaturePlot for M1/M2 scores
+      if (all(c("M1_score1", "M2_score1") %in% colnames(mac_subset@meta.data))) {
+        print(FeaturePlot(mac_subset, features = c("M1_score1", "M2_score1"), ncol = 2))
+        mac_subset$M1_M2_ratio <- mac_subset$M1_score1 - mac_subset$M2_score1
+      }
+
+      # Extract macrophage scores
+      mac_scores <- FetchData(mac_subset, vars = c("M1_score1", "M2_score1", "M1_M2_ratio", "disease", "cell_type"))
+
+      # Scatter plot: M1 vs M2 by disease
+      if ("disease" %in% colnames(mac_scores)) {
+        p_scatter <- ggplot(mac_scores, aes(x = M1_score1, y = M2_score1, color = disease)) +
+          geom_point(alpha = 0.5) +
+          geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") +
+          annotate("text", x = Inf, y = -Inf, label = "M2-skewed", hjust = 1.1, vjust = -0.5, size = 4, color = "blue") +
+          annotate("text", x = -Inf, y = Inf, label = "M1-skewed", hjust = -0.1, vjust = 1.5, size = 4, color = "red") +
+          labs(title = "M1 vs M2 Polarization by Disease", x = "M1 Score", y = "M2 Score") +
+          theme_minimal() +
+          theme(legend.position = "right")
+        print(p_scatter)
+
+        # Violin plot of M1/M2 ratio by disease
+        p_violin <- ggplot(mac_scores, aes(x = disease, y = M1_M2_ratio, fill = disease)) +
+          geom_violin(alpha = 0.7) +
+          geom_boxplot(width = 0.1, outlier.shape = NA, fill = "white") +
+          geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+          coord_flip() +
+          labs(title = "M1/M2 Balance Across Disease Subtypes",
+               subtitle = "Positive = M1-skewed, Negative = M2-skewed", x = "Disease", y = "M1-M2 Score Difference") +
+          theme_minimal() +
+          theme(legend.position = "none")
+        print(p_violin)
+
+        # Density plot
+        p_density <- ggplot(mac_scores, aes(x = M1_M2_ratio, fill = disease)) +
+          geom_density(alpha = 0.4) +
+          geom_vline(xintercept = 0, linetype = "dashed", color = "black", size = 1) +
+          labs(title = "Distribution of M1/M2 Balance Across Disease Subtypes",
+               x = "M1-M2 Score Difference", y = "Density") +
+          theme_minimal() +
+          theme(legend.position = "right")
+        print(p_density)
+      }
+
+      # Summary table
+      mac_summary <- mac_scores %>%
+        group_by(disease) %>%
+        summarise(
+          n_macrophages = n(),
+          mean_M1_score = mean(M1_score1, na.rm = TRUE),
+          mean_M2_score = mean(M2_score1, na.rm = TRUE),
+          mean_ratio = mean(M1_M2_ratio, na.rm = TRUE),
+          .groups = "drop"
+        ) %>%
+        mutate(
+          polarization = case_when(
+            mean_ratio > 0.1 ~ "M1-skewed",
+            mean_ratio < -0.1 ~ "M2-skewed",
+            TRUE ~ "Mixed"
+          )
+        ) %>%
+        arrange(desc(mean_ratio))
+
+      print(
+        mac_summary %>%
+          kable(digits = 3, caption = "Macrophage Polarization by Disease Subtype") %>%
+          kable_styling(bootstrap_options = c("striped", "hover"))
+      )
+    }
+  }
+}
+  
+```
+
+## Tumor Microenvironment Signatures
+
+```{r tme-signatures, fig.width=12, fig.height=8}
+# Define gene signatures for TME analysis
+tme_signatures <- list(
+  Cytotoxicity = c("GZMA", "GZMB", "PRF1", "GNLY", "NKG7"),
+  Exhaustion = c("PDCD1", "HAVCR2", "LAG3", "TIGIT", "TOX"),
+  Activation = c("CD69", "CD25", "IL2RA", "ICOS", "CD40LG"),
+  Proliferation = c("MKI67", "TOP2A", "PCNA", "CDK1"),
+  Immunosuppression = c("TGFB1", "IL10", "ARG1", "IDO1", "CD274")
+)
+
+# Calculate module scores for each signature
+for (sig_name in names(tme_signatures)) {
+  genes <- tme_signatures[[sig_name]]
+  present_genes <- genes[genes %in% rownames(seurat_obj)]
+  
+  if (length(present_genes) > 0) {
+    seurat_obj <- AddModuleScore(
+      seurat_obj,
+      features = list(present_genes),
+      name = paste0(sig_name, "_score")
+    )
+  }
+}
+
+# Visualize signatures
+score_names <- paste0(names(tme_signatures), "_score1")
+present_scores <- score_names[score_names %in% colnames(seurat_obj@meta.data)]
+
+if (length(present_scores) > 0) {
+  FeaturePlot(seurat_obj, features = present_scores, ncol = 3)
+  
+  # Compare across disease subtypes
+  if ("disease" %in% colnames(seurat_obj@meta.data)) {
+    score_data <- FetchData(seurat_obj, vars = c(present_scores, "disease"))
+    
+    score_avg <- score_data %>%
+      group_by(disease) %>%
+      summarise(across(all_of(present_scores), mean, na.rm = TRUE)) %>%
+      pivot_longer(cols = -disease, names_to = "signature", values_to = "score")
+    
+    ggplot(score_avg, aes(x = disease, y = score, fill = signature)) +
+      geom_bar(stat = "identity", position = "dodge") +
+      coord_flip() +
+      labs(title = "TME Signatures by Disease Subtype",
+           x = "Disease", y = "Average Score") +
+      theme_minimal() +
+      theme(legend.position = "right")
+  }
+}
+```
+
+## Statistical Testing: Disease-Associated Markers
+
+```{r disease-de-analysis}
+# Differential expression between disease subtypes
+if ("disease" %in% colnames(seurat_obj@meta.data)) {
+  
+  # Set disease as identity
+  Idents(seurat_obj) <- "disease"
+  
+  # Get disease categories with sufficient cells
+  disease_counts <- table(seurat_obj$disease)
+  diseases_to_compare <- names(disease_counts[disease_counts >= 50])
+  
+  if (length(diseases_to_compare) >= 2) {
+    cat("Comparing diseases with >=50 cells:\n")
+    cat(paste(diseases_to_compare, collapse = "\n"), "\n\n")
+    
+    # Example: TNBC vs invasive ductal
+    if ("triple-negative breast carcinoma" %in% diseases_to_compare &&
+        "invasive ductal breast carcinoma" %in% diseases_to_compare) {
+      
+      cat("Finding markers: TNBC vs Invasive Ductal Carcinoma\n")
+      
+      tnbc_markers <- FindMarkers(
+        seurat_obj,
+        ident.1 = "triple-negative breast carcinoma",
+        ident.2 = "invasive ductal breast carcinoma",
+        min.pct = 0.1,
+        logfc.threshold = 0.25
+      )
+      
+      tnbc_markers$gene <- rownames(tnbc_markers)
+      
+      cat("\nTop genes upregulated in TNBC:\n")
+      tnbc_markers %>%
+        filter(avg_log2FC > 0, p_val_adj < 0.05) %>%
+        arrange(desc(avg_log2FC)) %>%
+        head(15) %>%
+        dplyr::select(gene, avg_log2FC, pct.1, pct.2, p_val_adj) %>%
+        kable(digits = 3) %>%
+        kable_styling(bootstrap_options = c("striped", "hover"))
+      
+      cat("\nTop genes downregulated in TNBC:\n")
+      tnbc_markers %>%
+        filter(avg_log2FC < 0, p_val_adj < 0.05) %>%
+        arrange(avg_log2FC) %>%
+        head(15) %>%
+        dplyr::select(gene, avg_log2FC, pct.1, pct.2, p_val_adj) %>%
+        kable(digits = 3) %>%
+        kable_styling(bootstrap_options = c("striped", "hover"))
+      
+      # Volcano plot
+      tnbc_markers <- tnbc_markers %>%
+        mutate(
+          significance = case_when(
+            p_val_adj < 0.05 & avg_log2FC > 0.5 ~ "Up in TNBC",
+            p_val_adj < 0.05 & avg_log2FC < -0.5 ~ "Down in TNBC",
+            TRUE ~ "Not significant"
+          )
+        )
+      
+      ggplot(tnbc_markers, aes(x = avg_log2FC, y = -log10(p_val_adj), color = significance)) +
+        geom_point(alpha = 0.6) +
+        scale_color_manual(values = c("Up in TNBC" = "red", 
+                                      "Down in TNBC" = "blue", 
+                                      "Not significant" = "grey")) +
+        geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed") +
+        geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+        labs(title = "Differential Expression: TNBC vs Invasive Ductal Carcinoma",
+             x = "Log2 Fold Change", y = "-Log10(Adjusted P-value)") +
+        theme_minimal()
+    }
+  }
+}
+```
+
+---
+
+## Save Results
+
+```{r save-results}
+saveRDS(seurat_obj, file = "immune_compartment_subset_seurat_final.rds")
+cat("Saved Seurat object to: immune_compartment_subset_seurat_final.rds\n")
+```
+---
+
+# Session Information
+
+```{r session_info}
+sessionInfo()
+```
