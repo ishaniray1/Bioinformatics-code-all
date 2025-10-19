@@ -1,0 +1,128 @@
+---
+title: "Genomic Data Analysis Assessment"
+author: "Ishani Ray"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+    df_print: paged
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 7,
+  dpi = 300
+)
+```
+
+#Install maftools in R
+
+```{r install}
+# Install BiocManager if needed
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+# Install maftools
+BiocManager::install("maftools")
+
+```
+##Q6: Load and Summarize MAF File
+
+```{r Load and Summarize MAF File}
+library(maftools)
+
+# View available TCGA cohorts
+tcgaAvailable()
+
+# Load LGG cohort
+lgg <- tcgaLoad(study = "LGG")
+
+# View summary
+lgg
+
+# Get median variants per sample
+sample_summary <- getSampleSummary(lgg)
+colnames(sample_summary)
+head(sample_summary)
+
+total_variants <- sample_summary$total
+total_variants
+median(total_variants)
+
+```
+
+#Generate Required Plots
+
+##1. Oncoplot of Top 5 Mutated Genes
+
+```{r oncoplot}
+# Generate oncoplot
+# Set directory
+out_dir <- "C:/Users/isr4005/OneDrive - Oklahoma A and M System/extra 2/extra/Desktop"
+png(filename = file.path(out_dir, "oncoplot_top5.png"), width = 10, height = 8, units = "in", res = 300)
+oncoplot(maf = lgg, top = 5)
+dev.off()
+
+oncoplot(maf = lgg, top = 5)
+
+```
+
+###2. Transition/Transversion Ratio Boxplot
+
+```{r Ti/Tv}
+# Generate Ti/Tv plot
+png(file.path(out_dir, "titv_boxplot.png"), width = 8, height = 6, units = "in", res = 300)
+lgg_titv <- titv(maf = lgg, plot = TRUE, useSyn = TRUE)
+dev.off() 
+
+
+titv(maf = lgg, plot = TRUE, useSyn = TRUE)
+```
+
+###3. Mutation Load Comparison Across TCGA Cohorts
+
+```{r mutation load}
+# Compare mutation load with other TCGA cohorts
+png(file.path(out_dir, "mutation_load_comparison.png"), width = 10, height = 8, units = "in", res = 300)
+tcgaCompare(maf = lgg, cohortName = 'LGG', logscale = TRUE)
+dev.off() 
+
+tcgaCompare(maf = lgg, cohortName = 'LGG', logscale = TRUE)
+```
+
+# Genomic Data Analysis Assessment Answers
+
+## Q1: How many positions are found in the region 1:1105411-44137860?
+A: 69
+
+## Q2: How many samples are included in the VCF file?
+A: 90
+
+## Q3: How many positions are there total in the VCF file?
+A: 3489
+
+## Q4: How many positions have AC=1?
+A: 1075
+
+## Q5: What is the ts/tv ratio?
+A: 3.47
+
+## Q6: What is the median number of variants per sample in the LGG dataset?
+A: 28
+
+---
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
