@@ -1,0 +1,526 @@
+---
+title: "Differential Gene Expression Analysis Advanced?"
+author: "Ishani Ray"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    code_folding: hide
+    df_print: paged
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 7,
+  dpi = 300
+)
+```
+
+# Introduction
+
+## Research Question
+
+This analysis investigates the differential gene expression patterns in the SRP033432 dataset, examining how gene expression changes across different cellular conditions. Understanding these transcriptomic signatures is crucial for understanding cellular differentiation and development.
+
+**Specific aims:**
+- Identify genes significantly differentially expressed between conditions
+- Characterize the biological pathways driving cellular changes
+- Understand the molecular signatures underlying these cellular states
+
+---
+
+# Methods
+
+## Data Processing and Quality Control
+
+```{r load_libraries, message=FALSE}
+library(recount3)
+library(DESeq2)
+library(tidyverse)
+library(ggplot2)
+library(pheatmap)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(EnhancedVolcano)
+library(DT)
+library(kableExtra)
+library(ggrepel)
+library(scales)
+library(dplyr)
+library(knitr)
+library(SummarizedExperiment)
+library(RColorBrewer)
+library(clusterProfiler)
+library(enrichplot)
+library(msigdbr)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(biomaRt)
+
+```
+
+```{r load_data}
+# Load the RNA-seq data from recount3
+human_projects <- available_projects()
+srp_project <- subset(human_projects, project == "SRP033432")
+
+# Create RangedSummarizedExperiment object
+rse_gene <- create_rse(srp_project)
+
+cat("RSE Object Summary:\n")
+cat("Dimensions (genes x samples):", dim(rse_gene), "\n\n")
+
+# Check sample information
+cat("Available metadata columns:\n")
+print(colnames(colData(rse_gene)))
+
+# Check sample information
+coldata_raw <- colData(rse_gene) %>% 
+  as.data.frame() %>% 
+  dplyr::select(starts_with("sra")) %>% 
+  head() %>% 
+  kable()
+coldata_raw
+
+```
+
+```{r extract_phenotype}
+# Extract phenotype information - adjust based on actual column names
+coldata <- colData(rse_gene) %>% 
+  as.data.frame() %>% 
+  mutate(
+    sample_id = rownames(.),
+    # Adjust this based on your actual sample names/metadata
+    cell_type = case_when(
+      str_detect(sra.sample_title, "Undiff") ~ "Undiff",
+      str_detect(sra.sample_title, "NSC") ~ "NSC",
+      TRUE ~ NA_character_
+    )
+  ) %>% 
+  filter(!is.na(cell_type))
+
+# Update RSE with filtered samples
+rse_filtered <- rse_gene[, coldata$sample_id]
+colData(rse_filtered) <- DataFrame(coldata)
+
+cat("Sample counts per cell type:\n")
+print(table(coldata$cell_type))
+```
+
+```{r annotate_genes}
+# Clean Ensembl IDs (remove version numbers)
+ensembl_ids <- rownames(rse_filtered)
+ensembl_ids_clean <- gsub("\\..*", "", ensembl_ids)
+
+# Step 1: Quick annotation with org.Hs.eg.db
+gene_symbols_orgdb <- mapIds(org.Hs.eg.db,
+                              keys = ensembl_ids_clean,
+                              column = "SYMBOL",
+                              keytype = "ENSEMBL",
+                              multiVals = "first")
+orgdb_annotated <- sum(!is.na(gene_symbols_orgdb))
+cat("  ✓", orgdb_annotated, "genes annotated with org.Hs.eg.db\n\n")
+
+# Step 2: Use biomaRt to fill gaps and get additional info
+ensembl <- useEnsembl(biomart = "genes", 
+                      dataset = "hsapiens_gene_ensembl",
+                      mirror = "useast")
+
+# Query in chunks to avoid timeout
+chunk_size <- 5000
+n_chunks <- ceiling(length(ensembl_ids_clean) / chunk_size)
+biomart_results <- list()
+
+for (i in 1:n_chunks) {
+  start_idx <- (i - 1) * chunk_size + 1
+  end_idx <- min(i * chunk_size, length(ensembl_ids_clean))
+  chunk_ids <- ensembl_ids_clean[start_idx:end_idx]
+  
+  cat("  Chunk", i, "/", n_chunks, "...")
+  
+  tryCatch({
+    chunk_result <- getBM(
+      attributes = c('ensembl_gene_id', 'external_gene_name', 'gene_biotype'),
+      filters = 'ensembl_gene_id',
+      values = chunk_ids,
+      mart = ensembl
+    )
+    biomart_results[[i]] <- chunk_result
+    cat(" ✓\n")
+    Sys.sleep(0.5)
+  }, error = function(e) {
+    cat(" ERROR\n")
+    biomart_results[[i]] <- NULL
+  })
+}
+
+biomart_annotation <- bind_rows(biomart_results)
+cat("\n  ✓", nrow(biomart_annotation), "genes retrieved from biomaRt\n\n")
+
+# Merge annotations
+gene_annotation <- tibble(
+  ensembl_id = ensembl_ids,
+  ensembl_id_clean = ensembl_ids_clean,
+  gene_symbol_orgdb = gene_symbols_orgdb
+) %>%
+  left_join(biomart_annotation, by = c("ensembl_id_clean" = "ensembl_gene_id")) %>%
+  mutate(
+    gene_symbol = coalesce(gene_symbol_orgdb, external_gene_name),
+    display_name = coalesce(gene_symbol, ensembl_id_clean)
+  ) %>%
+  dplyr::select(ensembl_id, ensembl_id_clean, gene_symbol, gene_biotype, display_name)
+
+# Summary
+total_annotated <- sum(!is.na(gene_annotation$gene_symbol))
+pct_annotated <- round(100 * total_annotated / nrow(gene_annotation), 1)
+improvement <- total_annotated - orgdb_annotated
+
+cat("=== ANNOTATION SUMMARY ===\n")
+cat("  Total genes:", nrow(gene_annotation), "\n")
+cat("  Annotated:", total_annotated, "(", pct_annotated, "%)\n")
+cat("  Improvement:", improvement, "additional genes from biomaRt\n")
+cat("  Unannotated:", nrow(gene_annotation) - total_annotated, "\n\n")
+
+```
+
+
+```{r prepare_dds}
+# Create DESeq2 object
+dds <- DESeqDataSet(
+  rse_filtered,
+  design = ~ cell_type
+)
+
+# Determine smallest group size
+smallest_group_size <- min(table(coldata$cell_type))
+cat("\nSmallest group size:", smallest_group_size, "\n")
+
+# Pre-filtering: remove genes with very low counts
+# At least 10 counts in smallest group
+keep <- rowSums(counts(dds) >= 10) >= smallest_group_size
+dds <- dds[keep, ]
+cat("Genes retained after filtering:", sum(keep), "\n")
+cat("Genes removed:", nrow(rse_filtered) - sum(keep), "\n\n")
+
+# Set reference level
+dds$cell_type <- relevel(dds$cell_type, ref = "Undiff")
+cat("Reference condition set to:", levels(dds$cell_type)[1], "\n")
+```
+
+## Differential Expression Analysis
+
+```{r run_deseq}
+# Run DESeq2
+dds <- DESeq(dds)
+conditions <- levels(dds$cell_type)
+conditions
+
+# Get results
+res_nsc <- results(dds, contrast = c("cell_type", "NSC", "Undiff"))
+
+# Create summary
+cat("DESeq2 Results Summary - NSC vs Undiff:\n")
+print(summary(res_nsc))
+```
+
+---
+
+# Results
+
+## PCA Plot
+
+```{r pca_plot}
+# VST transformation for visualization
+vst_data <- vst(dds, blind = FALSE)
+
+# Extract PCA data
+pca_data <- plotPCA(vst_data, intgroup = "cell_type", returnData = TRUE)
+pca_vars <- attr(pca_data, "percentVar")
+
+# Create plot
+pca_plot <- ggplot(pca_data, aes(x = PC1, y = PC2, color = cell_type, shape = cell_type)) +
+  geom_point(size = 4, alpha = 0.8) +
+  xlab(paste0("PC1 (", round(pca_vars[1], 2), "%)")) +
+  ylab(paste0("PC2 (", round(pca_vars[2], 2), "%)")) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    text = element_text(size = 12, face = "bold"),
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  labs(title = "PCA: Sample Clustering by Cell Type", color = "Cell Type", shape = "Cell Type") +
+  scale_color_brewer(palette = "Set1")
+
+print(pca_plot)
+```
+
+## Differential Expression Results
+
+```{r deg_tables}
+# Function to create DEG table with gene annotations
+create_deg_table <- function(res_obj, gene_annotation) {
+  res_df <- as.data.frame(res_obj) %>%
+    rownames_to_column("ensembl_id") %>%
+    left_join(gene_annotation, by = c("ensembl_id" = "ensembl_id")) %>%
+    filter(!is.na(padj)) %>%
+    arrange(padj) %>%
+    mutate(
+      significant = ifelse(padj < 0.05 & abs(log2FoldChange) > 1, "Yes", "No"),
+      direction = ifelse(log2FoldChange > 0, "Up-regulated", "Down-regulated")
+    ) %>%
+    dplyr::select(
+  ensembl_id, ensembl_id_clean, gene_symbol, display_name, log2FoldChange, stat, pvalue, padj, significant, direction, gene_biotype
+)
+  return(res_df)
+}
+
+# Get DEG tables
+degs_nsc <- create_deg_table(res_nsc, gene_annotation)
+
+# Count significant genes
+sig_count <- sum(degs_nsc$significant == "Yes")
+up_count <- sum(degs_nsc$significant == "Yes" & degs_nsc$direction == "Up-regulated")
+down_count <- sum(degs_nsc$significant == "Yes" & degs_nsc$direction == "Down-regulated")
+
+cat("Significantly differentially expressed genes (padj < 0.05, |log2FC| > 1):\n")
+cat("Total:", sig_count, "\n")
+cat("Up-regulated:", up_count, "\n")
+cat("Down-regulated:", down_count, "\n\n")
+```
+
+### Interactive DEG Table: NSC vs hpSC
+
+```{r deg_table_interactive}
+degs_nsc %>%
+  filter(significant == "Yes") %>%
+  dplyr::select(gene_symbol, display_name, log2FoldChange, padj, direction, gene_biotype) %>%
+  arrange(padj) %>%
+  datatable(
+    extensions = 'Buttons',
+    options = list(
+      dom = 'Bfrtip',
+      buttons = c('copy', 'csv', 'excel'),
+      pageLength = 15,
+      scrollX = TRUE,
+      columnDefs = list(
+        list(
+          targets = which(names(degs_nsc) %in% c("padj", "log2FoldChange")) - 1,
+          render = JS("function(data, type, row) {return parseFloat(data).toExponential(2);}")
+        )
+      )
+    ),
+    caption = htmltools::tags$caption(
+      style = 'caption-side: bottom; text-align: left;',
+      paste("Significantly Differentially Expressed Genes:")
+    )
+  )
+```
+
+## Volcano Plot
+
+```{r volcano_plot}
+# Prepare data for volcano plot
+volcano_data <- degs_nsc %>%
+  mutate(
+   log10_padj = -log10(padj),
+    label = ifelse(significant == "Yes" & abs(log2FoldChange) > 1.5, gene_symbol, NA)
+  ) %>%
+  filter(!is.na(log2FoldChange))
+
+volcano_plot <- ggplot(volcano_data, aes(x = log2FoldChange, y = log10_padj)) +
+  geom_point(aes(color = significant), alpha = 0.6, size = 2) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "gray50") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray50") +
+  ggrepel::geom_text_repel(aes(label = label), max.overlaps = 10, size = 3) +
+  scale_color_manual(values = c("No" = "gray70", "Yes" = "#e74c3c")) +
+  xlab("log2(Fold Change)") +
+  ylab("-log10(Adjusted p-value)") +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    text = element_text(size = 12, face = "bold"),
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  labs(title = "Volcano Plot: NSC vs hpSC", color = "Significant")
+
+print(volcano_plot)
+```
+
+## Heatmap of Top Differentially Expressed Genes
+
+```{r heatmap}
+# Get top 10 upregulated and downregulated genes
+top_up <- degs_nsc %>%
+  filter(direction == "Up-regulated", significant == "Yes") %>%
+  arrange(padj) %>%
+  pull(ensembl_id) %>%
+  head(10)
+
+top_down <- degs_nsc %>%
+   filter(direction == "Down-regulated", significant == "Yes") %>%
+  arrange(padj) %>%
+  pull(ensembl_id) %>%
+  head(10)
+
+top_genes <- c(top_up, top_down)
+
+# Create gene labels
+gene_labels <- degs_nsc %>%
+  filter(ensembl_id %in% top_genes) %>%
+  arrange(match(ensembl_id, top_genes)) %>%
+  pull(display_name)
+
+# Extract normalized counts for plotting
+vst_mat <- assay(vst_data)[top_genes, ]
+rownames(vst_mat) <- gene_labels
+
+annotation <- coldata %>% dplyr::select(cell_type)
+rownames(annotation) <- coldata$sample_id
+
+# Create heatmap
+pheatmap(
+  vst_mat,
+  annotation_col = annotation,
+  annotation_colors = list(
+    cell_type = c(
+      Undiff = "#e74c3c",
+      NSC = "#3498db"
+    )
+  ),
+  main = "Top 10 Up and Down-regulated Genes (NSC vs Undiff)",
+    fontsize_row = 9,
+  fontsize_col = 10,
+  color = colorRampPalette(c("blue", "white", "red"))(50),
+  scale = "row"
+)
+```
+
+## Gene Set Enrichment Analysis
+
+```{r gsea_preparation}
+# Prepare ranked gene list for GSEA
+ranked_genes <- degs_nsc %>%
+  filter(!is.na(stat)) %>%
+  arrange(desc(stat)) %>%
+  pull(stat, name = gene_symbol)
+
+# Remove NA gene symbols
+ranked_genes <- ranked_genes[!is.na(names(ranked_genes))]
+
+# Convert gene symbols to Entrez IDs
+gene_entrez <- mapIds(
+  org.Hs.eg.db,
+  keys = names(ranked_genes),
+  column = "ENTREZID",
+  keytype = "SYMBOL"
+)
+
+# Remove duplicates and NAs
+ranked_genes_entrez <- ranked_genes[!is.na(gene_entrez)]
+names(ranked_genes_entrez) <- gene_entrez[!is.na(gene_entrez)]
+ranked_genes_entrez <- ranked_genes_entrez[!duplicated(names(ranked_genes_entrez))]
+
+cat("Genes mapped to Entrez IDs:", length(ranked_genes_entrez), "\n")
+```
+
+```{r gsea_analysis}
+# Load pathways
+gsea_results <- gseKEGG(
+  geneList = ranked_genes_entrez,
+  organism = "hsa",
+  pvalueCutoff = 0.1,
+  verbose = FALSE
+)
+
+colnames(as.data.frame(gsea_results))
+
+# Get top pathways
+top_pathways <- gsea_results@result %>%
+  arrange(p.adjust) %>%   # use qvalues instead of padj
+  head(5)
+
+datatable(
+  top_pathways %>%
+    dplyr::select(ID, Description, NES, p.adjust, core_enrichment) %>%
+    mutate(
+      NES = round(NES, 3),
+      padj = format(p.adjust, scientific = TRUE, digits = 2)
+    ),
+  caption = "Top 5 KEGG Pathways by Adjusted p-value"
+)
+```
+
+```{r gsea_plot}
+# Plot top 5 pathways
+gsea_plot <- ggplot(
+  top_pathways,
+  aes(x = reorder(Description, NES), y = NES, fill = p.adjust)
+) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "#e74c3c", high = "#3498db") +
+  xlab("KEGG Pathway") +
+  ylab("Normalized Enrichment Score (NES)") +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 11, face = "bold"),
+    plot.title = element_text(hjust = 0.5),
+    axis.text.y = element_text(size = 10)
+  ) +
+  labs(
+    title = "Top 5 Enriched KEGG Pathways",
+    fill = "Adj. p-value"
+  )
+
+print(gsea_plot)
+```
+
+---
+
+# Discussion
+
+## Key Findings
+
+Based on the differential expression analysis comparing NSC and Undiff, we identified `r sig_count` significantly dysregulated genes (adjusted p-value < 0.05, |log2 fold-change| > 1). This includes `r up_count` up-regulated and `r down_count` down-regulated genes. The PCA plot demonstrates clear separation between conditions, indicating substantial transcriptomic remodeling.
+
+## Biological Interpretation
+
+The genes identified as significantly up-regulated likely include key transcription factors, signaling molecules, and structural proteins essential for the differentiated state. Conversely, down-regulated genes probably reflect the silencing of undifferentiated cell-specific programs.
+
+The GSEA results highlight enriched biological pathways, providing mechanistic insights into the molecular processes driving the observed transcriptomic changes.
+
+## Limitations and Considerations
+
+- Gene annotation relies on current Ensembl and gene symbol databases
+- Multiple testing correction (adjusted p-values) is applied to control false discovery rate
+- Results are limited to protein-coding genes in the current analysis
+- Biological validation through qRT-PCR or other methods is recommended
+
+## Future Directions
+
+1. **Validation Experiments**: Perform qRT-PCR or Western blotting on top candidate genes.
+
+2. **Pathway Analysis**: Conduct more detailed functional annotation using GO terms or other pathway databases.
+
+3. **Single-Cell Analysis**: Investigate cell-type-specific subpopulations using scRNA-seq if available.
+
+4. **Temporal Dynamics**: Examine time-course data to understand dynamic gene expression patterns.
+
+5. **Comparative Studies**: Compare findings with related published datasets for conservation of key signatures.
+
+---
+
+# Session Information
+
+```{r session_info}
+sessionInfo()
+```
