@@ -1,0 +1,146 @@
+---
+title: "Linux CLI Training - Answers"
+author: "Ishani Ray"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+    df_print: paged
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 7,
+  dpi = 300
+)
+```
+
+# Linux CLI Training - Answers
+
+## Orientation to Linux Files and Navigation
+
+**Q1:** What is your home directory?
+A: /home/ubuntu
+
+**Q2:** What is the output of `ls` in my_folder/?
+A: hello_world.txt
+
+**Q3:** What is the output of each ls command after deleting hello_world.txt from my_folder/?
+A: my_folder is empty, my_folder2 shows hello_world.txt
+
+**Q4:** What is the output of listing my_folder/, my_folder2/, and my_folder3/?
+A: my_folder is empty, my_folder2 is empty, my_folder3 shows hello_world.txt
+
+## Scripting in the CLI
+
+**Q5:** What editor did you use and what was the command to save your file changes?
+A: I used nano. The command to save was Ctrl+O followed by Enter.
+
+## Set Up Protected Sudoer Account
+
+**Q6:** What is the error when trying to connect as sudouser?
+A: Server refused our key / No supported authentication methods available (server sent: publickey)
+
+**Q7:** What was the solution?
+A: I needed to copy the authorized_keys file from /home/ubuntu/.ssh/ to /home/sudouser/.ssh/ and set correct permissions (chmod 700 for .ssh directory, chmod 600 for authorized_keys file, and chown -R sudouser:sudouser /home/sudouser/.ssh)
+
+## Docker
+
+**Q8:** What does `sudo docker run` and `salmon swim` do?
+A: `sudo docker run combinelab/salmon` runs a container from the salmon Docker image. `salmon swim` is a command passed to the salmon program that displays version information and ASCII art.
+
+## Set Up Non-Sudo User
+
+**Q9:** What is the output of `sudo ls /root` as serveruser?
+A: serveruser is not in the sudoers file. This incident will be reported.
+
+## Mamba
+
+**Q10:** What is the output of `flask --version`?
+A: "Python 3.12.3" "Flask 3.1.2" "Werkzeug 3.1.3"
+
+**Q11:** What is the output of `mamba -V`?
+A: "mamba 1.4.2" "conda 23.3.1"
+
+## Mamba Environments
+
+**Q12:** What is the output of `which python` in py27 environment?
+A: /home/serveruser/mambaforge/envs/py27/bin/python
+
+**Q13:** What is the output of `which python` in base environment?
+A: /home/serveruser/mambaforge/bin/python
+
+## Installing Salmon
+
+**Q14:** What is the output of `salmon -h`?
+A: salmon v1.4.0
+
+Usage:  salmon -h|--help or
+        salmon -v|--version or
+        salmon -c|--cite or
+        salmon [--no-version-check] <COMMAND> [-h | options]
+
+Commands:
+     index      : create a salmon index
+     quant      : quantify a sample
+     alevin     : single cell analysis
+     swim       : perform super-secret operation
+     quantmerge : merge multiple quantifications into a single file
+
+
+## Simple RNA-Seq Analysis - Part 1
+
+**Q15:** What does the `-o athal.fa.gz` part of the command do?
+A: It specifies the output filename for the downloaded file.
+
+**Q16:** What is a .gz file?
+A: A .gz file is a gzip-compressed file.
+
+**Q17:** What does the `zcat` command do?
+A: zcat decompresses and displays the contents of a gzip-compressed file.
+
+**Q18:** What does the `head` command do?
+A: head displays the first lines of a file.
+
+**Q19:** What does the number 100 signify in the command?
+A: 100 specifies to show the first 100 lines.
+
+**Q20:** What is `|` doing?
+A: The pipe (|) passes the output of one command as input to another command.
+
+**Q21:** What is a .fa file? What is this file format used for?
+A: A .fa (or .fasta) file is a text-based format for representing nucleotide or protein sequences. It's used for storing sequence data in bioinformatics.
+
+## Simple RNA-Seq Analysis - Part 2
+
+**Q22:** What format are the downloaded sequencing reads in?
+A: The downloaded reads are in SRA format (.sra file).
+
+**Q23:** What is the total size of the disk?
+A: 15 G
+
+**Q24:** How much space is remaining on the disk?
+A: 6.8G
+
+**Q25:** What went wrong with `fastq-dump SRR074122`?
+A: "The disk ran out of space because uncompressed FASTQ files are very large" 
+
+**Q26:** What was your solution?
+A: I used `fastq-dump --gzip SRR074122` to compress the output as .fastq.gz, which saves disk space.
+
+---
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
